@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/ShiriezH/Gator/internal/config"
 	"github.com/ShiriezH/Gator/internal/database"
+	"github.com/ShiriezH/Gator/internal/rss"
 )
 
 type state struct {
@@ -57,7 +59,7 @@ func middlewareLoggedIn(
 	}
 }
 
-// scrapeFeeds - fetches and prints RSS feed for next feed to fetch in DB
+// scrapeFeeds - fetches the next feed to fetch, marks it as fetched, and saves new posts to DB
 func scrapeFeeds(s *state) {
 	feed, err := s.db.GetNextFeedToFetch(context.Background())
 	if err != nil {
@@ -65,24 +67,69 @@ func scrapeFeeds(s *state) {
 		return
 	}
 
-	// mark as fetched FIRST (prevents loops if crash happens later)
+	rssFeed, err := rss.FetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		fmt.Println("error fetching feed:", err)
+		return
+	}
+
+	// mark AFTER successful fetch
 	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
 	if err != nil {
 		fmt.Println("error marking feed:", err)
 		return
 	}
 
-	rss, err := fetchFeed(context.Background(), feed.Url)
-	if err != nil {
-		fmt.Println("error fetching feed:", err)
-		return
+	for _, item := range rssFeed.Channel.Item {
+		publishedAt, err := parseTime(item.PubDate)
+		if err != nil {
+			publishedAt = time.Now()
+		}
+
+		_, err = s.db.CreatePost(
+			context.Background(),
+			database.CreatePostParams{
+				ID:        uuid.New(),
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+				Title:     item.Title,
+				Url:       item.Link,
+				Description: sql.NullString{
+					String: item.Description,
+					Valid:  item.Description != "",
+				},
+				PublishedAt: sql.NullTime{
+					Time:  publishedAt,
+					Valid: true,
+				},
+				FeedID: feed.ID,
+			},
+		)
+
+		if err != nil {
+			fmt.Println("skipping duplicate or error:", err)
+			continue
+		}
+	}
+}
+
+// parseTime tries multiple formats to parse a date string from RSS feed
+func parseTime(dateStr string) (time.Time, error) {
+	layouts := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822,
+		time.RFC822Z,
+		time.RFC3339,
 	}
 
-	fmt.Printf("\n=== %s ===\n", feed.Name)
-
-	for _, item := range rss.Channel.Item {
-		fmt.Println("-", item.Title)
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, dateStr); err == nil {
+			return t, nil
+		}
 	}
+
+	return time.Now(), fmt.Errorf("could not parse time")
 }
 
 // users handler - lists all users in DB, marks current user
@@ -332,6 +379,42 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+// browse handler - lists recent posts from feeds current user is following, with optional limit
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+
+	if len(cmd.args) > 0 {
+		var err error
+		limit, err = strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit")
+		}
+	}
+
+	posts, err := s.db.GetPostsForUser(
+		context.Background(),
+		database.GetPostsForUserParams{
+			Name:  user.Name,
+			Limit: int32(limit),
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	for _, post := range posts {
+		fmt.Printf("\n%s\n%s\n", post.Title, post.Url)
+
+		if post.PublishedAt.Valid {
+			fmt.Println(post.PublishedAt.Time.Format(time.RFC822))
+		} else {
+			fmt.Println("unknown date")
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	// Load config
 	cfg, err := config.Read()
@@ -366,6 +449,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	// CLI args
 	if len(os.Args) < 2 {
